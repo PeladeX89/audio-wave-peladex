@@ -281,7 +281,7 @@ static void release_audio_weak(audio_shader_source *s)
 	s->audio_weak = nullptr;
 }
 
-static void audio_capture_cb(void *param, obs_source_t *, const audio_data *audio, bool muted)
+static void audio_capture_cb(void *param, obs_source_t *source, const audio_data *audio, bool muted)
 {
 	auto *s = static_cast<audio_shader_source *>(param);
 	if (!s || !audio || !s->alive.load(std::memory_order_acquire))
@@ -313,6 +313,8 @@ static void audio_capture_cb(void *param, obs_source_t *, const audio_data *audi
 	const float *left = reinterpret_cast<const float *>(audio->data[0]);
 	const float *right = audio->data[1] ? reinterpret_cast<const float *>(audio->data[1]) : nullptr;
 
+	const float mixer_volume = source ? obs_source_get_volume(source) : 1.0f;
+
 	float sum_sq = 0.0f;
 	float peak = 0.0f;
 
@@ -324,9 +326,9 @@ static void audio_capture_cb(void *param, obs_source_t *, const audio_data *audi
 	}
 
 	for (size_t i = 0; i < frames; ++i) {
-		const float l = left[i];
-		const float r = right ? right[i] : l;
-		const float mono = 0.5f * (l + r);
+    	const float l = left[i] * mixer_volume;
+    	const float r = right ? right[i] * mixer_volume : l;
+    	const float mono = 0.5f * (l + r);
 		sum_sq += mono * mono;
 		peak = std::max(peak, std::fabs(mono));
 

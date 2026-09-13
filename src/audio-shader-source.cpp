@@ -46,7 +46,56 @@ static inline float db_to_norm(float db, float react_db, float peak_db)
 {
 	if (peak_db <= react_db)
 		return 0.0f;
+
 	return clamp01((db - react_db) / (peak_db - react_db));
+}
+
+static bool is_lateral_spectrum_source(audio_shader_source *s)
+{
+	if (!s || !s->self)
+		return false;
+
+	const char *name = obs_source_get_name(s->self);
+
+	if (!name)
+		return false;
+
+	return std::strncmp(name, "EspectroLaterales", 17) == 0;
+}
+
+static float get_lateral_mixer_scale(audio_shader_source *s)
+{
+	/*
+	 * Solo afecta a fuentes cuyo nombre empiece por:
+	 * EspectroLaterales
+	 *
+	 * Escala:
+	 *
+	 * -16 dB o menos =   0 %
+	 * -12 dB          =  25 %
+	 *  -8 dB          =  50 %
+	 *  -4 dB          =  75 %
+	 *   0 dB          = 100 %
+	 */
+
+	if (!is_lateral_spectrum_source(s))
+		return 1.0f;
+
+	if (!s->audio_weak)
+		return 0.0f;
+
+	obs_source_t *target = obs_weak_source_get_source(s->audio_weak);
+
+	if (!target)
+		return 0.0f;
+
+	const float volume = obs_source_get_volume(target);
+
+	obs_source_release(target);
+
+	const float mixer_db = amp_to_db(volume);
+
+	return clamp01((mixer_db + 16.0f) / 16.0f);
 }
 
 static inline float hash01(float n)
@@ -284,6 +333,7 @@ static void release_audio_weak(audio_shader_source *s)
 static void audio_capture_cb(void *param, obs_source_t *source, const audio_data *audio, bool muted)
 {
 	auto *s = static_cast<audio_shader_source *>(param);
+
 	if (!s || !audio || !s->alive.load(std::memory_order_acquire))
 		return;
 
@@ -292,33 +342,65 @@ static void audio_capture_cb(void *param, obs_source_t *source, const audio_data
 	if (muted || audio->frames == 0 || !audio->data[0]) {
 		if (muted && audio && audio->frames > 0) {
 			std::lock_guard<std::mutex> lock(s->audio_mutex);
+
 			const size_t n = s->mono_ring.size();
+
 			if (n > 0) {
-				const size_t fill = std::min(static_cast<size_t>(audio->frames), n);
+				const size_t fill =
+					std::min(static_cast<size_t>(audio->frames), n);
+
 				for (size_t i = 0; i < fill; ++i) {
 					s->mono_ring[s->mono_pos] = 0.0f;
 					s->mono_pos = (s->mono_pos + 1) % n;
+
 					if (s->mono_count < n)
 						++s->mono_count;
 				}
 			}
+
 			s->raw_level = 0.0f;
 			s->raw_peak = 0.0f;
 		}
+
 		s->audio_cb_inflight.fetch_sub(1, std::memory_order_acq_rel);
 		return;
 	}
 
 	const size_t frames = audio->frames;
-	const float *left = reinterpret_cast<const float *>(audio->data[0]);
-	const float *right = audio->data[1] ? reinterpret_cast<const float *>(audio->data[1]) : nullptr;
 
-	const float mixer_volume = source ? obs_source_get_volume(source) : 1.0f;
+	const float *left =
+		reinterpret_cast<const float *>(audio->data[0]);
+
+	const float *right =
+		audio->data[1]
+			? reinterpret_cast<const float *>(audio->data[1])
+			: nullptr;
+
+	/*
+	 * Comportamiento normal:
+	 * el análisis sigue el volumen del mezclador de OBS.
+	 *
+	 * Excepción:
+	 * EspectroLaterales analiza el audio original sin aplicar el fader.
+	 * Su intensidad visual se controlará después con:
+	 *
+	 * -16 dB =   0 %
+	 * -12 dB =  25 %
+	 *  -8 dB =  50 %
+	 *  -4 dB =  75 %
+	 *   0 dB = 100 %
+	 */
+	float mixer_volume =
+		source ? obs_source_get_volume(source) : 1.0f;
+
+	if (is_lateral_spectrum_source(s))
+		mixer_volume = 1.0f;
 
 	float sum_sq = 0.0f;
 	float peak = 0.0f;
 
 	std::lock_guard<std::mutex> lock(s->audio_mutex);
+
 	if ((int)s->mono_ring.size() != s->fft_size) {
 		s->mono_ring.assign((size_t)s->fft_size, 0.0f);
 		s->mono_pos = 0;
@@ -326,19 +408,23 @@ static void audio_capture_cb(void *param, obs_source_t *source, const audio_data
 	}
 
 	for (size_t i = 0; i < frames; ++i) {
-    	const float l = left[i] * mixer_volume;
-    	const float r = right ? right[i] * mixer_volume : l;
-    	const float mono = 0.5f * (l + r);
+		const float l = left[i] * mixer_volume;
+		const float r = right ? right[i] * mixer_volume : l;
+		const float mono = 0.5f * (l + r);
+
 		sum_sq += mono * mono;
 		peak = std::max(peak, std::fabs(mono));
 
 		s->mono_ring[s->mono_pos] = mono;
 		s->mono_pos = (s->mono_pos + 1) % s->mono_ring.size();
+
 		if (s->mono_count < s->mono_ring.size())
 			++s->mono_count;
 	}
 
-	s->raw_level = std::sqrt(sum_sq / std::max<size_t>(1, frames));
+	s->raw_level =
+		std::sqrt(sum_sq / std::max<size_t>(1, frames));
+
 	s->raw_peak = peak;
 
 	s->audio_cb_inflight.fetch_sub(1, std::memory_order_acq_rel);
@@ -620,24 +706,54 @@ static void update_band_texture(audio_shader_source *s)
 	if (!s)
 		return;
 
+	/*
+	 * Para EspectroLaterales:
+	 *
+	 * -16 dB o menos =   0 %
+	 * -12 dB          =  25 %
+	 *  -8 dB          =  50 %
+	 *  -4 dB          =  75 %
+	 *   0 dB          = 100 %
+	 *
+	 * Para cualquier otro Audio Shader Engine:
+	 * mixer_scale = 1.0
+	 */
+	const float mixer_scale = get_lateral_mixer_scale(s);
+
 	for (size_t i = 0; i < s->bands.size(); ++i) {
 		const size_t px = i * 4;
-		s->band_texture_pixels[px + 0] = uint8_t(clamp01(s->bands[i]) * 255.0f + 0.5f);
-		s->band_texture_pixels[px + 1] = uint8_t(clamp01(s->bass) * 255.0f + 0.5f);
-		s->band_texture_pixels[px + 2] = uint8_t(clamp01(s->mid) * 255.0f + 0.5f);
-		s->band_texture_pixels[px + 3] = uint8_t(clamp01(s->treble) * 255.0f + 0.5f);
+
+		s->band_texture_pixels[px + 0] =
+			uint8_t(clamp01(s->bands[i] * mixer_scale) * 255.0f + 0.5f);
+
+		s->band_texture_pixels[px + 1] =
+			uint8_t(clamp01(s->bass * mixer_scale) * 255.0f + 0.5f);
+
+		s->band_texture_pixels[px + 2] =
+			uint8_t(clamp01(s->mid * mixer_scale) * 255.0f + 0.5f);
+
+		s->band_texture_pixels[px + 3] =
+			uint8_t(clamp01(s->treble * mixer_scale) * 255.0f + 0.5f);
 	}
 
 	if (!s->band_texture) {
 		const uint8_t *data[] = {s->band_texture_pixels.data()};
-		s->band_texture = gs_texture_create(64, 1, GS_RGBA, 1, data, GS_DYNAMIC);
+
+		s->band_texture =
+			gs_texture_create(64, 1, GS_RGBA, 1, data, GS_DYNAMIC);
+
 		if (!s->band_texture) {
-			BLOG(LOG_ERROR, "Failed to create FFT band texture for source '%s'",
+			BLOG(LOG_ERROR,
+			     "Failed to create FFT band texture for source '%s'",
 			     obs_source_get_name(s->self));
 			return;
 		}
 	} else {
-		gs_texture_set_image(s->band_texture, s->band_texture_pixels.data(), 64 * 4, false);
+		gs_texture_set_image(
+			s->band_texture,
+			s->band_texture_pixels.data(),
+			64 * 4,
+			false);
 	}
 }
 
@@ -652,31 +768,100 @@ static void set_texture_param(gs_effect_t *effect, const char *name, gs_texture_
 static void set_shader_params(audio_shader_source *s)
 {
 	gs_effect_t *e = s->effect;
+
 	if (!e)
 		return;
 
+	/*
+	 * Para EspectroLaterales:
+	 *
+	 * -16 dB o menos =   0 %
+	 * -12 dB          =  25 %
+	 *  -8 dB          =  50 %
+	 *  -4 dB          =  75 %
+	 *   0 dB          = 100 %
+	 *
+	 * Para cualquier otro Audio Shader Engine:
+	 * mixer_scale = 1.0
+	 */
+	const float mixer_scale = get_lateral_mixer_scale(s);
+
 	set_vec2_param(e, "source_size", float(s->width), float(s->height));
 	set_vec2_param(e, "resolution", float(s->width), float(s->height));
-	set_float_param(e, "time", float(os_gettime_ns() / 1000000000.0));
-	set_float_param(e, "audio_level", s->level);
-	set_float_param(e, "audio_peak", s->peak);
-	set_float_param(e, "audio_bass", s->bass);
-	set_float_param(e, "audio_mid", s->mid);
-	set_float_param(e, "audio_treble", s->treble);
-	set_float_param(e, "band_count", float(s->band_count));
 
-	set_texture_param(e, "audio_band_texture", s->band_texture);
-	set_texture_param(e, "audio_spectrum_texture", s->band_texture);
+	set_float_param(
+		e,
+		"time",
+		float(os_gettime_ns() / 1000000000.0));
+
+	set_float_param(
+		e,
+		"audio_level",
+		s->level * mixer_scale);
+
+	set_float_param(
+		e,
+		"audio_peak",
+		s->peak * mixer_scale);
+
+	set_float_param(
+		e,
+		"audio_bass",
+		s->bass * mixer_scale);
+
+	set_float_param(
+		e,
+		"audio_mid",
+		s->mid * mixer_scale);
+
+	set_float_param(
+		e,
+		"audio_treble",
+		s->treble * mixer_scale);
+
+	set_float_param(
+		e,
+		"band_count",
+		float(s->band_count));
+
+	set_texture_param(
+		e,
+		"audio_band_texture",
+		s->band_texture);
+
+	set_texture_param(
+		e,
+		"audio_spectrum_texture",
+		s->band_texture);
 
 	for (size_t i = 0; i < s->options.size(); ++i) {
 		char name[32];
-		snprintf(name, sizeof(name), "option%zu", i + 1);
-		set_float_param(e, name, s->options[i]);
+
+		snprintf(
+			name,
+			sizeof(name),
+			"option%zu",
+			i + 1);
+
+		set_float_param(
+			e,
+			name,
+			s->options[i]);
 	}
+
 	for (size_t i = 0; i < s->colors.size(); ++i) {
 		char name[32];
-		snprintf(name, sizeof(name), "color%zu", i + 1);
-		set_color_param(e, name, s->colors[i]);
+
+		snprintf(
+			name,
+			sizeof(name),
+			"color%zu",
+			i + 1);
+
+		set_color_param(
+			e,
+			name,
+			s->colors[i]);
 	}
 }
 
